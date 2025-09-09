@@ -1,0 +1,22 @@
+name: sv-env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.4
+  - r-essentials
+  - r-seurat
+  - r-dplyr
+  - r-ggplot2
+  - r-matrixstats
+  - r-plyr
+  - r-r6
+  - r-scales
+  - r-cluster
+  - r-umap
+  - r-pheatmap
+  - r-hmisc
+#  - bioconductor-singlecellexperiment
+#  - bioconductor-summarizedexperiment
+#  - bioconductor-dropletutils

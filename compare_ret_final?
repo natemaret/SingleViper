@@ -1,0 +1,517 @@
+#Run citeseq.R before``
+setwd("/Users/natemaretzki/Desktop/ObradovicLab/standard-workflow-main")
+library(viper)
+library(SingleR)
+library(celldex)
+library(umap)
+library(ggplot2)
+library(Seurat)
+library(matrixStats)
+library(dplyr)
+library(cluster)
+library(pheatmap)
+library(Hmisc)
+library(tidyr)
+library(scales)
+library(zellkonverter)
+library(DropletUtils)
+library(Matrix)
+
+source("classes/utils.r")
+source("classes/loader.r")
+source("classes/SVpreprocessor.r")
+source("classes/metacell_generator.r")
+source("classes/runnercustom.r")
+source("classes/clusterer.r")
+source("classes/plotter.r")
+
+
+SingleR_custom <- function(test, trained_labels, ref_mat, metric = "pearson") {
+  common_genes <- sort(intersect(rownames(test), rownames(ref_mat)))
+  test <- test[common_genes, , drop = FALSE]
+  ref_mat <- ref_mat[common_genes, , drop = FALSE]
+  stopifnot(identical(rownames(test), rownames(ref_mat)))
+  
+  # Drop zero-variance rows
+  test_sd <- matrixStats::rowSds(as.matrix(test))
+  ref_sd  <- matrixStats::rowSds(as.matrix(ref_mat))
+  keep <- (test_sd > 1e-6) & (ref_sd > 1e-6)
+  test <- test[keep, , drop = FALSE]
+  ref_mat <- ref_mat[keep, , drop = FALSE]
+  
+  # Pearson correlation
+  similarity <- cor(as.matrix(ref_mat), as.matrix(test), method = metric)
+  
+  # Ensure 2D matrix
+  if (is.null(dim(similarity))) {
+    similarity <- matrix(similarity, nrow = 1)
+    colnames(similarity) <- colnames(test)
+    rownames(similarity) <- colnames(ref_mat)
+  }
+  
+  best_indices <- apply(similarity, 2, function(x) which.max(x)[1])
+  best_labels <- as.character(trained_labels)[best_indices]
+  
+  DataFrame(
+    scores = I(t(similarity)),
+    labels = best_labels
+  )
+}
+
+recode_label <- function(x, mapping) {
+  for (canon in names(mapping)) {
+    if (x %in% mapping[[canon]]) return(canon)
+  }
+  return("T Cell/Myeloid Doublet?")
+}
+
+calculate_purity <- function(predicted, ground_truth) {
+  tab <- table(predicted, ground_truth)
+  sum(apply(tab, 1, max)) / length(predicted)
+}
+
+calculate_overall_accuracy <- function(predicted, ground_truth) {
+  mean(predicted == ground_truth)
+}
+
+per_label_accuracy <- function(predicted, ground_truth) {
+  df <- data.frame(predicted = predicted, ground_truth = ground_truth)
+  df %>%
+    dplyr::group_by(ground_truth) %>%
+    dplyr::summarise(
+      accuracy = mean(predicted == ground_truth),
+      .groups = "drop"
+    )
+}
+
+thin_to_depth <- function(mat, depth, seed=1) {
+  set.seed(seed)
+  mat <- as(mat, "dgCMatrix")
+  totals <- Matrix::colSums(mat)
+  p <- pmin(1, depth / pmax(totals, 1))
+  for (j in seq_len(ncol(mat))) {
+    idx <- mat@p[j] + seq_len(mat@p[j+1] - mat@p[j])
+    if (length(idx))
+      mat@x[idx] <- rbinom(length(idx), size = mat@x[idx], prob = p[j])
+  }
+  mat
+}
+
+safe_readRDS <- function(f) {
+  obj <- tryCatch(readRDS(f), error = function(e) NULL)
+  if (is.null(obj) || length(obj) == 0) {
+    message("Skipping empty regulon file: ", f)
+    return(NULL)
+  }
+  return(obj)
+}
+
+label_map <- list(
+  "B Cells" = c("B-cells", "B Cells"),
+  "CD4+ T-cells" = c("CD4+ T-cells", "CD4 T cells"),
+  "CD8+ T-cells" = c("CD8+ T-cells", "CD8 T cells"),
+  "HSC" = c("HSC", "Hematopoietic stem cell"),
+  "Myeloid" = c("Monocytes", "Neutrophils", "Macrophages", "Chondrocytes", "Mesangial cells"),
+  "NK Cells" = c("NK cells", "Natural killer cells"),
+  "T Cell/Myeloid Doublet?" = c(
+    "Smooth muscle", "Skeletal muscle", "Myocytes", "Pericytes",
+    "Epithelial cells", "Fibroblasts", "Endothelial cells",
+    "Adipocytes", "Astrocytes", "Melanocytes", "Keratinocytes",
+    "Eosinophils", "Erythrocytes"
+  )
+)
+
+
+
+#--- PATHS  ---
+
+viper_output <- "/Users/natemaretzki/Desktop/ObradovicLab/viper_query"
+ref = readRDS("/Users/natemaretzki/Desktop/ObradovicLab/SingleViper_Data/ref/ref.rds")
+query = readRDS("/Users/natemaretzki/Desktop/ObradovicLab/SingleViper_Data/query/query.rds")
+
+regulator_dir_path <- paste0("/Users/natemaretzki/Desktop/ObradovicLab/regulators/human_hugo")
+regulator_files <- list(
+  cotfs = file.path(regulator_dir_path, "cotfs-hugo.txt"),
+  surface = file.path(regulator_dir_path, "surface-hugo.txt"),
+  sig = file.path(regulator_dir_path, "sig-hugo.txt"),
+  tfs = file.path(regulator_dir_path, "tfs-hugo.txt")
+)
+aracne_exec <- "/Users/natemaretzki/Desktop/ARACNe3/build/src/app/ARACNe3_app"
+
+query_aracne_outdir <- "/Users/natemaretzki/Desktop/ObradovicLab/output_query"
+
+depths <- c(8000, 4000, 2000, 1000, 500, 200)
+
+purity_SV_list <- list()
+purity_SR_list <- list()
+acc_SV_list <- list()
+acc_SR_list <- list()
+overall_acc_SV <- list()
+overall_acc_SR <- list()
+fidelity_list  <- list()
+
+#--- BASE ---
+
+ref_expr  <- SummarizedExperiment::assay(ref, "logcounts")
+query_expr <- as.matrix(query)
+
+rownames(ref_expr)  <- gsub("^HUMAN_", "", rownames(ref_expr))
+rownames(query_expr) <- gsub("^HUMAN_", "", rownames(query_expr))
+common_genes <- intersect(rownames(ref_expr), rownames(query_expr))
+ref_expr  <- ref_expr[common_genes, ]
+query_expr <- query_expr[common_genes, ]
+
+ref_cpm   <- sweep(ref_expr, 2, colSums(ref_expr), FUN = "/") * 1e6
+query_cpm <- sweep(query_expr, 2, colSums(query_expr), FUN = "/") * 1e6
+
+ref_log   <- log1p(ref_cpm)
+query_log <- log1p(query_cpm)
+
+ref_means <- rowMeans(ref_log)
+ref_sds   <- apply(ref_log, 1, sd)
+ref_sds[ref_sds == 0] <- 1e-6
+
+keep_genes <- ref_sds > 0.2
+ref_z   <- t(scale(t(ref_log[keep_genes, ]), center=TRUE, scale=TRUE))
+query_z <- t(scale(t(query_log[keep_genes, ]), center=TRUE, scale=TRUE))
+
+ref_seurat_full <- CreateSeuratObject(counts = as(ref_expr, "dgCMatrix"))
+ref_seurat_full <- FindVariableFeatures(ref_seurat_full, nfeatures = 3000)
+hvg_genes <- VariableFeatures(ref_seurat_full)
+
+ref_z   <- ref_z[hvg_genes[hvg_genes %in% rownames(ref_z)], , drop=FALSE]
+query_z <- query_z[hvg_genes[hvg_genes %in% rownames(query_z)], , drop=FALSE]
+
+query_seurat_clust <- CreateSeuratObject(counts = query_expr)
+query_seurat_clust <- NormalizeData(query_seurat_clust, verbose = FALSE)
+query_seurat_clust <- FindVariableFeatures(query_seurat_clust, verbose = FALSE)
+query_seurat_clust <- ScaleData(query_seurat_clust, verbose = FALSE)
+
+clusterer_query <- Clusterer$new(query_seurat_clust, verbose = FALSE)
+clusterer_query$run_clustering()
+
+silhouette_results_query <- clusterer_query$calc_silhouette_scores()
+
+best_resolution_query <- silhouette_results_query$best_resolution
+query_seurat_clust <- clusterer_query$set_best_clusters(best_resolution_query)
+
+top_genes <- clusterer_query$find_top_genes()
+
+plotter <- Plotter$new(query_seurat_clust, query_aracne_outdir)
+plotter$plot_silhouette_scores(silhouette_results_query$mean_scores,
+                               silhouette_results_query$sd_scores)
+
+plotter$plot_umap_clusters()
+
+query_seurat_clust <- plotter$seurat_obj
+
+query_metacell_gen <- MetacellGenerator$new(query_seurat_clust, query_aracne_outdir)
+query_metacells <- query_metacell_gen$generate_metacell_matrices()
+
+query_runner <- Runner$new(
+  query_metacells,
+  query_aracne_outdir,
+  aracne_exec,
+  query_aracne_outdir,
+  regulator_files,
+  query_seurat_for_aracne,
+  viper_output,
+  threads = 4,
+  seed = 42
+)
+
+query_runner$run_aracne()
+query_runner$create_rds()
+
+regulon_files <- list.files(
+  query_aracne_outdir,
+  pattern = "_pruned\\.rds$",
+  full.names = TRUE
+)
+
+regulon_list <- lapply(regulon_files, safe_readRDS)
+regulon_list <- Filter(Negate(is.null), regulon_list)
+all_regulons <- do.call(c, regulon_list)
+all_regulons <- lapply(all_regulons, function(reg) {
+  valid_targets <- intersect(names(reg$tfmode), rownames(ref_z))
+  
+  if (length(valid_targets) == 0) return(NULL)
+  
+  reg$tfmode <- reg$tfmode[valid_targets]
+  
+  if (!is.null(reg$likelihood) && length(reg$likelihood) == length(reg$tfmode)) {
+    reg$likelihood <- reg$likelihood[valid_targets]
+  } else {
+    inferred_likelihood <- abs(reg$tfmode)
+    inferred_likelihood <- inferred_likelihood / max(inferred_likelihood, na.rm = TRUE)
+    reg$likelihood <- inferred_likelihood
+  }
+  
+  return(reg)
+})
+all_regulons <- all_regulons[!sapply(all_regulons, is.null)]
+
+ref_viper_full <- viper(ref_z, all_regulons)
+query_viper_full <- viper(query_z, all_regulons)
+
+
+
+for(depth in depths) {
+  
+  files <- list.files(query_aracne_outdir, full.names = TRUE)
+  unlink(files, recursive = TRUE)
+  
+  ref_expr <- SummarizedExperiment::assay(ref, "logcounts")
+  query_expr <- as.matrix(query)
+  
+  rownames(query_expr) <- gsub("^HUMAN_", "", rownames(query_expr))
+  rownames(query_expr) <- gsub("^ERCC_", "", rownames(query_expr))
+  
+  query_expr <- thin_to_depth(query_expr, depth)
+  orig_totals  <- Matrix::colSums(query_expr)
+  thin_totals  <- Matrix::colSums(thin_to_depth(query_expr, 8000))
+  cat("Mean UMI before:", mean(orig_totals), 
+      "after:", mean(thin_totals), "\n")
+  
+  orig_log  <- log1p(sweep(as.matrix(query),      2, colSums(query),      "/") * 1e6)
+  degr_log  <- log1p(sweep(as.matrix(query_expr), 2, colSums(query_expr), "/") * 1e6)
+  
+  common <- intersect(rownames(orig_log), rownames(degr_log))
+  orig_log <- orig_log[common, , drop=FALSE]
+  degr_log <- degr_log[common, , drop=FALSE]
+  
+  cell_self_cor <- sapply(colnames(orig_log), function(cn) {
+    cor(orig_log[, cn], degr_log[, cn], method="pearson")
+  })
+  fidelity_list[[as.character(depth)]] <- mean(cell_self_cor, na.rm=TRUE)
+  
+  ref_cpm   <- sweep(ref_expr,   2, colSums(ref_expr),   FUN = "/") * 1e6
+  query_cpm <- sweep(query_expr, 2, colSums(query_expr), FUN = "/") * 1e6
+  
+  query_seurat_for_aracne <- CreateSeuratObject(counts = log1p(query_expr))
+  query_seurat_for_aracne <- SetAssayData(query_seurat_for_aracne, slot = "data", new.data = query_cpm)
+  
+  overlap_genes <- sort(intersect(rownames(ref_cpm), rownames(query_cpm)))
+  ref_cpm <- ref_cpm[overlap_genes, ]
+  query_cpm <- query_cpm[overlap_genes, ]
+  
+  ref_seurat <- CreateSeuratObject(counts = ref_cpm)
+  VariableFeatures(ref_seurat) <- NULL
+  ref_seurat <- FindVariableFeatures(ref_seurat, selection.method = "vst", nfeatures = 3000)
+  hvg_genes <- VariableFeatures(ref_seurat)
+  top_genes <- hvg_genes
+  
+  ref_cpm <- ref_cpm[top_genes, ]
+  query_cpm <- query_cpm[top_genes, ]
+  
+  ref_log <- log1p(ref_cpm)
+  query_log <- log1p(query_cpm)
+  
+  ref_log <- as.matrix(ref_log)
+  query_log <- as.matrix(query_log)
+  
+  ref_means <- rowMeans(ref_log)
+  ref_sds <- apply(ref_log, 1, sd)
+  ref_sds[ref_sds == 0] <- 1e-6
+  
+  ref_z   <- t(scale(t(ref_log), center=TRUE, scale=TRUE))
+  query_z <- t(scale(t(query_log), center=TRUE, scale=TRUE))
+  
+  keep_genes <- (ref_sds > 0.2) & (abs(ref_means) < 5)
+  query_z <- query_z[keep_genes, ]
+  
+  keep_genes <- matrixStats::rowSds(as.matrix(query_z)) > 1e-6
+  query_z <- query_z[keep_genes, , drop = FALSE]
+  
+  #--- CLUSTER/METACELL ---
+  
+  query_seurat_clust <- CreateSeuratObject(counts = query_expr)
+  query_seurat_clust <- NormalizeData(query_seurat_clust, verbose = FALSE)
+  query_seurat_clust <- FindVariableFeatures(query_seurat_clust, verbose = FALSE)
+  query_seurat_clust <- ScaleData(query_seurat_clust, verbose = FALSE)
+  
+  clusterer_query <- Clusterer$new(query_seurat_clust, verbose = FALSE)
+  clusterer_query$run_clustering()
+  
+  silhouette_results_query <- clusterer_query$calc_silhouette_scores()
+  
+  best_resolution_query <- silhouette_results_query$best_resolution
+  query_seurat_clust <- clusterer_query$set_best_clusters(best_resolution_query)
+  
+  top_genes <- clusterer_query$find_top_genes()
+  
+  plotter <- Plotter$new(query_seurat_clust, query_aracne_outdir)
+  plotter$plot_silhouette_scores(silhouette_results_query$mean_scores,
+                                 silhouette_results_query$sd_scores)
+  
+  plotter$plot_umap_clusters()
+  
+  query_seurat_clust <- plotter$seurat_obj
+  
+  query_metacell_gen <- MetacellGenerator$new(query_seurat_clust, query_aracne_outdir)
+  query_metacells <- query_metacell_gen$generate_metacell_matrices()
+  
+  #--- ARACNE/VIPER ---
+  
+  query_runner <- Runner$new(
+    query_metacells,
+    query_aracne_outdir,
+    aracne_exec,
+    query_aracne_outdir,
+    regulator_files,
+    query_seurat_for_aracne,
+    viper_output,
+    threads = 4,
+    seed = 42
+  )
+  
+  query_runner$run_aracne()
+  query_runner$create_rds()
+  
+  regulon_files <- list.files(
+    query_aracne_outdir,
+    pattern = "_pruned\\.rds$",
+    full.names = TRUE
+  )
+  
+  regulon_list <- lapply(regulon_files, safe_readRDS)
+  regulon_list <- Filter(Negate(is.null), regulon_list)
+  
+  if (length(regulon_list) == 0) {
+    stop("No usable regulons found.")
+  }
+  
+  all_regulons <- do.call(c, regulon_list)
+  
+  all_regulons <- lapply(all_regulons, function(reg) {
+    valid_targets <- intersect(names(reg$tfmode), rownames(ref_z))
+    
+    if (length(valid_targets) == 0) return(NULL)
+    
+    reg$tfmode <- reg$tfmode[valid_targets]
+    
+    if (!is.null(reg$likelihood) && length(reg$likelihood) == length(reg$tfmode)) {
+      reg$likelihood <- reg$likelihood[valid_targets]
+    } else {
+      inferred_likelihood <- abs(reg$tfmode)
+      inferred_likelihood <- inferred_likelihood / max(inferred_likelihood, na.rm = TRUE)
+      reg$likelihood <- inferred_likelihood
+    }
+    
+    return(reg)
+  })
+  all_regulons <- all_regulons[!sapply(all_regulons, is.null)]
+  
+  
+  ref_viper_full   <- viper(ref_z, all_regulons)
+  query_viper_full <- viper(query_z, all_regulons)
+  
+  ref_viper <- ref_viper_full
+  query_viper <- viper(query_z, all_regulons)
+  
+  shared_tfs   <- intersect(rownames(query_viper_full), rownames(query_viper))
+  shared_cells <- intersect(colnames(query_viper_full), colnames(query_viper))
+  
+  cellwise_corr <- sapply(shared_cells, function(cell) {
+    cor(
+      query_viper_full[shared_tfs, cell],
+      query_viper[shared_tfs, cell],
+      method = "pearson",
+      use = "pairwise.complete.obs"
+    )
+  })
+  
+  fidelity <- mean(cellwise_corr, na.rm = TRUE)
+  fidelity_list[[as.character(depth)]] <- fidelity
+  cat("Depth", depth, "→ mean VIPER global fidelity =", round(fidelity, 4), "\n")
+  
+  
+  
+  ref_labels <- ref_seurat_full$celltype[colnames(ref_viper)]
+  stopifnot(!any(is.na(ref_labels)))
+  
+  ref_log_subset <- ref_log
+  
+  common_tfs <- intersect(rownames(query_viper), rownames(ref_mat_subset))
+  query_for_match <- query_viper[common_tfs, , drop = FALSE]
+  ref_for_match   <- ref_viper[common_tfs, , drop = FALSE]
+  
+  SingleViperPred <- SingleR_custom(
+    test = query_for_match,
+    trained_labels = ref_labels,
+    ref_mat = ref_for_match,
+    metric = "pearson"
+  )
+  SVLabels <- SingleViperPred$labels
+  
+  # SingleR baseline on gene space
+  common_genes <- intersect(rownames(query_log), rownames(ref_log_subset))
+  SingleRPred <- SingleR_custom(
+    test = query_log[common_genes,, drop=FALSE],
+    trained_labels = ref_labels,
+    ref_mat = ref_log_subset[common_genes,, drop=FALSE],
+    metric = "pearson"
+  )
+  SRLabels <- SingleRPred$labels
+  
+  SVLabels_recode <- setNames(
+    vapply(SVLabels, recode_label, character(1), mapping = label_map),
+    names(SVLabels)
+  )
+  SRLabels_recode <- setNames(
+    vapply(SRLabels, recode_label, character(1), mapping = label_map),
+    names(SRLabels)
+  )
+  
+  common_cells <- intersect(colnames(query_z), colnames(integrated_seurat))
+  true_labels_aligned <- integrated_seurat$mapped_idents[common_cells]
+  names(SVLabels_recode) <- common_cells
+  names(SRLabels_recode) <- common_cells
+  
+  SVLabels_aligned <- SVLabels_recode[common_cells]
+  SRLabels_aligned <- SRLabels_recode[common_cells]
+  true_labels_aligned <- integrated_seurat$mapped_idents[common_cells]
+  
+  
+  purity_SV <- calculate_purity(SVLabels_aligned, true_labels_aligned)
+  acc_SV <- per_label_accuracy(SVLabels_aligned, true_labels_aligned)
+  overall_accuracy_SV <- calculate_overall_accuracy(SVLabels_aligned, true_labels_aligned)
+  
+  purity_SR <- calculate_purity(SRLabels_aligned, true_labels_aligned)
+  acc_SR <- per_label_accuracy(SRLabels_aligned, true_labels_aligned)
+  overall_accuracy_SR <- calculate_overall_accuracy(SRLabels_aligned, true_labels_aligned)
+  
+  purity_SV_list[[as.character(depth)]] <- purity_SV
+  purity_SR_list[[as.character(depth)]] <- purity_SR
+  acc_SV_list[[as.character(depth)]] <- acc_SV
+  acc_SR_list[[as.character(depth)]] <- acc_SR
+  overall_acc_SV[[as.character(depth)]] <- overall_accuracy_SV
+  overall_acc_SR[[as.character(depth)]] <- overall_accuracy_SR
+  
+  cat("Finished with depth:", depth, "\n")
+  cat("SingleR accuracy:", overall_acc_SR[[as.character(depth)]], "\n")
+  cat("SV accuracy:", overall_acc_SV[[as.character(depth)]], "\n")
+}
+
+#--- PLOT ---
+
+depths <- as.numeric(names(overall_acc_SV))
+
+df <- data.frame(
+  depth = depths,
+  purity_SV = unlist(purity_SV_list[names(overall_acc_SV)]),
+  purity_SR = unlist(purity_SR_list[names(overall_acc_SV)]),
+  acc_SV   = unlist(overall_acc_SV),
+  acc_SR   = unlist(overall_acc_SR)
+)
+print(df)
+
+df_long <- df %>%
+  pivot_longer(cols = -depth, names_to="metric", values_to="score")
+
+ggplot(df_long, aes(x=depth, y=score, color=metric)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title="Purity & Accuracy (SV vs SR)",
+       x="UMI Depth", y="Score")
